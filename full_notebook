@@ -1,0 +1,391 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.linear_model import LogisticRegressionCV, LogisticRegression
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import log_loss, accuracy_score, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import roc_curve
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+#################################################################
+# 1. HELPER FUNCTIONS & EVALUATION
+#################################################################
+def logistic(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+def evaluate_model_all(model, X, y):
+    """
+    Returns (LogLoss, Accuracy, AUC).
+    'model' can be:
+      - a Pipeline (for ENet_FM, AL_Submodel, AL_Pretest, etc.)
+      - a tuple: (beta, intercept, unused, reference)
+    """
+    if isinstance(model, Pipeline):
+        p = model.predict_proba(X)[:, 1]
+    else:
+        beta, intercept, _, ref = model
+        # 'ref' is expected to be a tuple: (scaler, model)
+        if isinstance(ref, Pipeline):
+            scaler = ref.named_steps["scaler"]
+        else:
+            if not isinstance(ref, tuple):
+               raise ValueError("reference should be a tuple.")
+            if len(ref) != 2:
+              raise ValueError(f"Expected a 2-tuple for ref, got a {len(ref)}-tuple")
+            scaler = ref[0]
+        X_sc = scaler.transform(X)
+        z = X_sc @ beta + intercept
+        p = logistic(z)
+    eps = 1e-15
+    p = np.clip(p, eps, 1-eps)
+    ll = -np.mean(y * np.log(p) + (1-y) * np.log(1-p))
+    pred = (p >= 0.5).astype(int)
+    acc = accuracy_score(y, pred)
+    auc_val = roc_auc_score(y, p)
+    return ll, acc, auc_val
+
+#################################################################
+# 2. FULL MODEL: ELASTIC NET (ENet_FM)
+#################################################################
+def fit_full_model_elasticnet(X, y, cv_folds=5, l1_ratio=0.5):
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("enet", LogisticRegressionCV(
+            penalty='elasticnet',
+            solver='saga',
+            l1_ratios=[l1_ratio],
+            cv=StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42),
+            Cs=10,
+            max_iter=10000,
+            scoring='neg_log_loss',
+            fit_intercept=True,
+            refit=True
+        ))
+    ])
+    pipe.fit(X, y)
+    return pipe
+
+#################################################################
+# 3. CLASSICAL ADAPTIVE LASSO (AL_Submodel)
+#################################################################
+def fit_adaptive_lasso(X, y, gamma=1.0, cv_folds=5, lambda_grid=None):
+    """
+    Classic two-step adaptive Lasso for logistic regression.
+    Returns a 4-tuple: (beta_final, intercept_final, None, (scaler, model_lasso))
+    """
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    model_init = LogisticRegressionCV(
+        penalty='l2', solver='lbfgs', cv=cv_folds, max_iter=10000, fit_intercept=True
+    )
+    model_init.fit(X_scaled, y)
+    beta_init = model_init.coef_.ravel()
+    
+    eps = 1e-6
+    weights = 1.0 / (np.abs(beta_init) + eps) ** gamma
+    X_weighted = X_scaled / weights[np.newaxis, :]
+    
+    if lambda_grid is None:
+        lambda_grid = [0.0001, 0.001, 0.05, 0.01, 1, 2]
+    C_grid = [1.0 / lam for lam in lambda_grid]
+    
+    model_lasso = LogisticRegressionCV(
+        penalty='l1', solver='saga', cv=cv_folds, Cs=C_grid, max_iter=10000,
+        fit_intercept=True, scoring='neg_log_loss'
+    )
+    model_lasso.fit(X_weighted, y)
+    
+    beta_weighted = model_lasso.coef_.ravel()
+    beta_final = beta_weighted / weights
+    intercept_final = model_lasso.intercept_[0]
+    
+    # Return as a 4-tuple: add None as placeholder for unused third element.
+    return beta_final, intercept_final, None, (scaler, model_lasso)
+
+#################################################################
+# 4. MCP APPROXIMATION (MCP_Submodel) VIA SCALING OF ADAPTIVE LASSO
+#################################################################
+def fit_mcp_approx(X, y, gamma=1.0, cv_folds=5, alpha_grid=None):
+    """
+    Approximates MCP by scaling the adaptive Lasso solution.
+    Returns (beta_mcp, intercept_mcp, best_alpha, (scaler, model_lasso)).
+    """
+    if alpha_grid is None:
+        alpha_grid = np.linspace(0.2, 2.0, 8)
+    beta_al, intercept_al, _, ref = fit_adaptive_lasso(X, y, gamma=gamma, cv_folds=cv_folds)
+    scaler, _ = ref
+    X_scaled = scaler.transform(X)
+    
+    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    best_alpha = None
+    best_loss = np.inf
+    for alpha in alpha_grid:
+        beta_candidate = alpha * beta_al
+        losses = []
+        for train_idx, test_idx in skf.split(X_scaled, y):
+            X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            z_test = X_test @ beta_candidate + intercept_al
+            p_test = logistic(z_test)
+            eps = 1e-15
+            p_test = np.clip(p_test, eps, 1-eps)
+            loss = -np.mean(y_test * np.log(p_test) + (1-y_test) * np.log(1-p_test))
+            losses.append(loss)
+        mean_loss = np.mean(losses)
+        if mean_loss < best_loss:
+            best_loss = mean_loss
+            best_alpha = alpha
+    beta_mcp = best_alpha * beta_al
+    intercept_mcp = intercept_al
+    return (beta_mcp, intercept_mcp, best_alpha, ref)
+
+#################################################################
+# 5. STEIN-TYPE SHRINKAGE FUNCTIONS
+#################################################################
+def stein_shrinkage(beta_fm, beta_sm, sigma2, df_sm):
+    diff = beta_sm - beta_fm
+    norm_sq = np.sum(diff**2)
+    if norm_sq <= 1e-12:
+        c = 0.0
+    else:
+        c = 1.0 - ((df_sm - 2) * sigma2) / norm_sq
+    beta_shrink = beta_fm + c * diff
+    return c, beta_shrink
+
+def stein_shrinkage_positive(beta_fm, beta_sm, sigma2, df_sm):
+    c, _ = stein_shrinkage(beta_fm, beta_sm, sigma2, df_sm)
+    c_pos = max(0.0, c)
+    beta_shrink_pos = beta_fm + c_pos * (beta_sm - beta_fm)
+    return c_pos, beta_shrink_pos
+
+#################################################################
+# 6. PRETEST ESTIMATOR FUNCTIONS
+#################################################################
+def compute_negative_log_likelihood(X, y, model):
+    if isinstance(model, Pipeline):
+        p = model.predict_proba(X)[:, 1]
+    else:
+        beta, intercept, _, ref = model
+        if isinstance(ref, Pipeline):
+            scaler = ref.named_steps["scaler"]
+        elif isinstance(ref, tuple):
+            scaler = ref[0]
+        else:
+            raise ValueError("Unknown reference type in model tuple.")
+        X_sc = scaler.transform(X)
+        z = X_sc @ beta + intercept
+        p = logistic(z)
+    eps = 1e-15
+    p = np.clip(p, eps, 1-eps)
+    return -np.sum(y*np.log(p) + (1-y)*np.log(1-p))
+
+def simulate_null_distribution(X, y, fit_submodel_func, fit_full_model_func, n_simulations=50):
+    sm_fit = fit_submodel_func(X, y)
+    if isinstance(sm_fit, Pipeline):
+        p_sub = sm_fit.predict_proba(X)[:, 1]
+    else:
+        beta, intercept, _, ref = sm_fit
+        if isinstance(ref, Pipeline):
+            scaler = ref.named_steps["scaler"]
+        elif isinstance(ref, tuple):
+            scaler = ref[0]
+        else:
+            raise ValueError("Unknown reference type in simulation.")
+        X_sc = scaler.transform(X)
+        z = X_sc @ beta + intercept
+        p_sub = logistic(z)
+    LRTs = []
+    a=0
+    for _ in range(n_simulations):
+        a=a+1
+        print(f'{a}th simulation ends')
+        y_sim = np.random.binomial(1, p_sub)
+        sm_nll = compute_negative_log_likelihood(X, y_sim, fit_submodel_func(X, y_sim))
+        fm_nll = compute_negative_log_likelihood(X, y_sim, fit_full_model_func(X, y_sim))
+        LRT = 2.0 * (sm_nll - fm_nll)
+        LRTs.append(LRT)
+    return np.array(LRTs)
+
+def pretest_estimator(X, y, fit_submodel_func, fit_full_model_func, crit_val):
+    sm_fit = fit_submodel_func(X, y)
+    sm_nll = compute_negative_log_likelihood(X, y, sm_fit)
+    fm_fit = fit_full_model_elasticnet(X, y)  # using full model
+    fm_nll = compute_negative_log_likelihood(X, y, fm_fit)
+    LRT = 2.0 * (sm_nll - fm_nll)
+    if LRT <= crit_val:
+        return sm_fit, "Submodel"
+    else:
+        return fm_fit, "FullModel"
+
+#################################################################
+# 7. PLOTTING FUNCTIONS
+#################################################################
+def plot_lrt_null_distribution(lrt_stats, critical_value, model_name="Submodel"):
+    plt.figure(figsize=(8, 5))
+    sns.histplot(lrt_stats, bins=30, color='skyblue', kde=False)
+    plt.title(f"LRT Null Distribution for {model_name}")
+    plt.xlabel("LRT Statistic")
+    plt.ylabel("Frequency")
+    xmin, xmax = plt.xlim()
+    x_fill = np.linspace(critical_value, xmax, 100)
+    yhist, _ = np.histogram(lrt_stats, bins=30)
+    ymax = max(yhist) if len(yhist) else 1
+    plt.fill_between(x_fill, 0, ymax, color='red', alpha=0.3, label='Rejection Region')
+    plt.axvline(critical_value, color='red', linestyle='--', linewidth=2,
+                label=f"Critical Value = {critical_value:.2f}")
+    plt.legend()
+    plt.grid(axis='y', alpha=0.7)
+    plt.show()
+
+def predict_proba_universal(model, X):
+    if isinstance(model, Pipeline):
+        return model.predict_proba(X)[:, 1]
+    else:
+        beta, intercept, _, ref = model
+        if isinstance(ref, Pipeline):
+            scaler = ref.named_steps["scaler"]
+        elif isinstance(ref, tuple):
+            scaler = ref[0]
+        else:
+            raise ValueError("Unknown reference type in predict_proba_universal.")
+        X_sc = scaler.transform(X)
+        z = X_sc @ beta + intercept
+        return logistic(z)
+
+def plot_roc_curves(models_dict, X, y):
+    plt.figure(figsize=(7, 5))
+    for mname, model in models_dict.items():
+        p_pred = predict_proba_universal(model, X)
+        fpr, tpr, _ = roc_curve(y, p_pred)
+        auc_val = roc_auc_score(y, p_pred)
+        plt.plot(fpr, tpr, label=f"{mname} (AUC={auc_val:.2f})")
+    plt.plot([0, 1], [0, 1], '--', color='gray', label='Chance')
+    plt.title("ROC Curves")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.grid(alpha=0.7)
+    plt.show()
+
+def plot_calibration_curves(models_dict, X, y, n_bins=10):
+    plt.figure(figsize=(7, 5))
+    for mname, model in models_dict.items():
+        p_pred = predict_proba_universal(model, X)
+        frac_pos, mean_pred = calibration_curve(y, p_pred, n_bins=n_bins)
+        plt.plot(mean_pred, frac_pos, 'o-', label=mname)
+    plt.plot([0, 1], [0, 1], '--', color='gray', label='Perfect')
+    plt.xlabel("Mean Predicted Probability")
+    plt.ylabel("Fraction of Positives")
+    plt.title("Calibration Curves")
+    plt.legend()
+    plt.grid(alpha=0.7)
+    plt.show()
+
+#################################################################
+# 8. MAIN DEMO USING YOUR EEG DATA
+#################################################################
+if __name__ == "__main__":
+    #----------------------------------------
+    # 1) Load your EEG connectivity dataset.
+    #----------------------------------------
+    data = pd.read_csv('path/data.csv')
+    y = data['condition'].values
+    X = data.drop(columns=['condition']).values
+
+    #----------------------------------------
+    # 2) Fit FULL MODEL: ENet_FM
+    #----------------------------------------
+    fm_model = fit_full_model_elasticnet(X, y, cv_folds=5, l1_ratio=0.5)
+    fm_ll, fm_acc, fm_auc = evaluate_model_all(fm_model, X, y)
+    print(f"[ENet_FM] LogLoss={fm_ll:.4f}, Accuracy={fm_acc:.3f}, AUC={fm_auc:.3f}")
+
+    #----------------------------------------
+    # 3) Fit SUBMODEL: Adaptive Lasso (AL_Submodel)
+    #----------------------------------------
+    beta_al, intercept_al, _, adaptive_info = fit_adaptive_lasso(X, y, gamma=1.0, cv_folds=5)
+    al_model = (beta_al, intercept_al, None, adaptive_info)  # Force 4-tuple
+    al_ll, al_acc, al_auc = evaluate_model_all(al_model, X, y)
+    print(f"[AL_Submodel] LogLoss={al_ll:.4f}, Accuracy={al_acc:.3f}, AUC={al_auc:.3f}")
+
+    #----------------------------------------
+    # 4) Fit SUBMODEL: MCP Approximation (MCP_Submodel)
+    #----------------------------------------
+    mcp_model = fit_mcp_approx(X, y, gamma=1.0, cv_folds=5)
+    mcp_ll, mcp_acc, mcp_auc = evaluate_model_all(mcp_model, X, y)
+    print(f"[MCP_Submodel] LogLoss={mcp_ll:.4f}, Accuracy={mcp_acc:.3f}, AUC={mcp_auc:.3f}")
+
+    #----------------------------------------
+    # 5) Pretest Estimators:
+    #    a) AL_Pretest (using AL_Submodel)
+    #    b) MCP_Pretest (using MCP_Submodel)
+    #----------------------------------------
+    n_sim = 5
+    # AL_Pretest:
+    lrt_al = simulate_null_distribution(X, y,
+                    lambda X_, y_: fit_adaptive_lasso(X_, y_, gamma=1.0, cv_folds=5),
+                    lambda X_, y_: fit_full_model_elasticnet(X_, y_, cv_folds=5, l1_ratio=0.5),
+                    n_simulations=n_sim)
+    crit_val_al = np.quantile(lrt_al, 1 - 0.05)
+    al_pretest_model, al_pretest_choice = pretest_estimator(X, y,
+                    lambda X_, y_: fit_adaptive_lasso(X_, y_, gamma=1.0, cv_folds=5),
+                    lambda X_, y_: fit_full_model_elasticnet(X_, y_, cv_folds=5, l1_ratio=0.5),
+                    crit_val_al)
+    al_pretest_ll, al_pretest_acc, al_pretest_auc = evaluate_model_all(al_pretest_model, X, y)
+    print(f"[AL_Pretest] Chosen: {al_pretest_choice}, LogLoss={al_pretest_ll:.4f}, Accuracy={al_pretest_acc:.3f}, AUC={al_pretest_auc:.3f}")
+    # MCP_Pretest:
+    lrt_mcp = simulate_null_distribution(X, y,
+                    lambda X_, y_: fit_mcp_approx(X_, y_, gamma=1.0, cv_folds=5),
+                    lambda X_, y_: fit_full_model_elasticnet(X_, y_, cv_folds=5, l1_ratio=0.5),
+                    n_simulations=n_sim)
+    crit_val_mcp = np.quantile(lrt_mcp, 1 - 0.05)
+    mcp_pretest_model, mcp_pretest_choice = pretest_estimator(X, y,
+                    lambda X_, y_: fit_mcp_approx(X_, y_, gamma=1.0, cv_folds=5),
+                    lambda X_, y_: fit_full_model_elasticnet(X_, y_, cv_folds=5, l1_ratio=0.5),
+                    crit_val_mcp)
+    mcp_pretest_ll, mcp_pretest_acc, mcp_pretest_auc = evaluate_model_all(mcp_pretest_model, X, y)
+    print(f"[MCP_Pretest] Chosen: {mcp_pretest_choice}, LogLoss={mcp_pretest_ll:.4f}, Accuracy={mcp_pretest_acc:.3f}, AUC={mcp_pretest_auc:.3f}")
+
+    #----------------------------------------
+    # 6) Stein-type Shrinkage Estimators:
+    #    a) AL_Stein and AL_SteinPos (using AL_Submodel)
+    #    b) MCP_S and MCP_PS (using MCP_Submodel)
+    #----------------------------------------
+    def extract_from_ENet(pipe):
+        lr = pipe.named_steps["enet"]
+        return lr.coef_.ravel(), lr.intercept_[0]
+    beta_enet_scaled, int_enet = extract_from_ENet(fm_model)
+    # For AL, we already have beta_al and intercept_al.
+    # Compute sigma2 estimate (naively using residuals on standardized X)
+    sigma2_est = np.mean((y - StandardScaler().fit_transform(X) @ beta_enet_scaled - int_enet)**2)
+    df_al = np.sum(np.abs(beta_al) > 1e-6)
+    c_al, beta_al_st = stein_shrinkage(beta_enet_scaled, beta_al, sigma2_est, df_al)
+    c_al_pos, beta_al_st_pos = stein_shrinkage_positive(beta_enet_scaled, beta_al, sigma2_est, df_al)
+    def make_manual_model(ref, beta, intercept):
+        return (beta, intercept, None, ref)
+    al_stein_model = make_manual_model(adaptive_info, beta_al_st, intercept_al)
+    al_steinp_model = make_manual_model(adaptive_info, beta_al_st_pos, intercept_al)
+    al_stein_ll, al_stein_acc, al_stein_auc = evaluate_model_all(al_stein_model, X, y)
+    al_steinp_ll, al_steinp_acc, al_steinp_auc = evaluate_model_all(al_steinp_model, X, y)
+    print(f"[AL_Stein] c={c_al:.3f}, LogLoss={al_stein_ll:.4f}, Accuracy={al_stein_acc:.3f}, AUC={al_stein_auc:.3f}")
+    print(f"[AL_SteinPos] c={c_al_pos:.3f}, LogLoss={al_steinp_ll:.4f}, Accuracy={al_steinp_acc:.3f}, AUC={al_steinp_auc:.3f}")
+    
+    beta_mcp_approx, intercept_mcp, best_alpha_mcp, ref_mcp = mcp_model
+    df_mcp = np.sum(np.abs(beta_mcp_approx) > 1e-6)
+    c_mcp, beta_mcp_S = stein_shrinkage(beta_enet_scaled, beta_mcp_approx, sigma2_est, df_mcp)
+    c_mcp_pos, beta_mcp_PS = stein_shrinkage_positive(beta_enet_scaled, beta_mcp_approx, sigma2_est, df_mcp)
+    mcp_S_model = (beta_mcp_S, intercept_mcp, None, ref_mcp)
+    mcp_PS_model = (beta_mcp_PS, intercept_mcp, None, ref_mcp)
+    mcp_S_ll, mcp_S_acc, mcp_S_auc = evaluate_model_all(mcp_S_model, X, y)
+    mcp_PS_ll, mcp_PS_acc, mcp_PS_auc = evaluate_model_all(mcp_PS_model, X, y)
+    print(f"[MCP_S] c={c_mcp:.3f}, LogLoss={mcp_S_ll:.4f}, Accuracy={mcp_S_acc:.3f}, AUC={mcp_S_auc:.3f}")
+    print(f"[MCP_PS] c={c_mcp_pos:.3f}, LogLoss={mcp_PS_ll:.4f}, Accuracy={mcp_PS_acc:.3f}, AUC={mcp_PS_auc:.3f}")
+
